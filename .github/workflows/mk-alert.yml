@@ -6,11 +6,12 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "run = normal check, test = send a test message"
+        description: "test = send a test message, history = list recent MK setups, run = normal check"
         default: "test"
         type: choice
         options:
           - test
+          - history
           - run
 
 permissions:
@@ -39,7 +40,8 @@ jobs:
           TWELVE_DATA_KEY: ${{ secrets.TWELVE_DATA_KEY }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: python mk_alert.py ${{ github.event.inputs.mode == 'test' && '--test' || '' }} ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+          HISTORY_DAYS: "5"
+        run: python mk_alert.py ${{ github.event.inputs.mode == 'test' && '--test' || '' }} ${{ github.event.inputs.mode == 'history' && '--history' || '' }} ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
 
       - name: Save state
         run: |
