@@ -12,8 +12,10 @@ What it does on every run:
 Secrets are read from environment variables (GitHub Actions secrets):
   TWELVE_DATA_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
 
-Options:  --test   send a test message and check that data download works
-          --force  ignore the "only fetch right after a candle closes" rule
+Options:  --test     send a test message and check that data download works
+          --force    ignore the "only fetch right after a candle closes" rule
+          --history  send the MK setups found in the last N days (env HISTORY_DAYS, default 5)
+                     so you can compare them with your TradingView chart
 """
 import json
 import os
@@ -48,6 +50,7 @@ INV_TOL = 0.1        # invalidation tolerance beyond MK (x ATR)
 MAX_WAIT = 60        # max bars to wait after CHOCH
 
 HISTORY = 500        # candles downloaded per request
+HISTORY_BIG = 2000   # candles downloaded in --history mode
 LOOKBACK_BARS = 3    # only alert for setups that completed in the last N closed candles
 STATE_FILE = "state.json"
 LOCAL_TZ = timezone(timedelta(hours=3, minutes=30))  # shown in messages (UTC+3:30)
@@ -213,13 +216,13 @@ def detect(candles):
 
 
 # ───────────────────────── Data / Telegram ─────────────────────────
-def fetch(td_symbol, interval, tf_min, api_key, now):
+def fetch(td_symbol, interval, tf_min, api_key, now, size=HISTORY):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
             "symbol": td_symbol,
             "interval": interval,
-            "outputsize": HISTORY,
+            "outputsize": size,
             "timezone": "UTC",
             "apikey": api_key,
         },
@@ -287,11 +290,46 @@ def save_state(state):
         json.dump(state, f, indent=1, sort_keys=True)
 
 
+# ───────────────────────── History mode ─────────────────────────
+def run_history(api_key, token, chat_id, now):
+    """Sends the MK setups found in the last N days (no state is saved, nothing is marked as sent).
+    Use it to compare with the same period on your TradingView chart."""
+    days = int(os.environ.get("HISTORY_DAYS", "5"))
+    cutoff = now - timedelta(days=days)
+    for name, td_symbol, kind, digits in SYMBOLS:
+        for interval, tf_min in TIMEFRAMES:
+            try:
+                candles = fetch(td_symbol, interval, tf_min, api_key, now, size=HISTORY_BIG)
+            except Exception as e:
+                text = f"MK history {name} {tf_min}m: FAILED ({str(e)[:80]})"
+                print(text)
+                send_telegram(token, chat_id, text)
+                time.sleep(1)
+                continue
+            time.sleep(1)
+            if not candles:
+                continue
+            events = [ev for ev in detect(candles) if ev["t"] >= cutoff]
+            first = candles[0]["t"].astimezone(LOCAL_TZ).strftime("%m-%d %H:%M")
+            lines = [f"MK history | {name} {tf_min}m | last {days} days | {len(events)} setups | data from {first} (UTC+3:30)"]
+            for k, ev in enumerate(events, 1):
+                side = "SELL" if ev["dir"] == 1 else "BUY"
+                close_t = (ev["t"] + timedelta(minutes=tf_min)).astimezone(LOCAL_TZ).strftime("%m-%d %H:%M")
+                lines.append(
+                    f"{k}) {side} {close_t} | zone {ev['zlo']:.{digits}f} - {ev['zhi']:.{digits}f}"
+                    f"{' + sweep' if ev['sweep'] else ''}"
+                )
+            text = "\n".join(lines)
+            print(text)
+            send_telegram(token, chat_id, text)
+
+
 # ───────────────────────── Main ─────────────────────────
 def main():
     args = sys.argv[1:]
     test = "--test" in args
     force = "--force" in args
+    history = "--history" in args
 
     api_key = os.environ.get("TWELVE_DATA_KEY", "")
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -301,6 +339,9 @@ def main():
         sys.exit(1)
 
     now = datetime.now(timezone.utc)
+    if history:
+        run_history(api_key, token, chat_id, now)
+        return
     state = load_state()
     changed = not os.path.exists(STATE_FILE)
     test_lines = []
