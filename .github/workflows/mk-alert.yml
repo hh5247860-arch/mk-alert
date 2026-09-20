@@ -6,13 +6,31 @@ on:
   workflow_dispatch:
     inputs:
       mode:
-        description: "test = send a test message, history = list recent MK setups, run = normal check"
-        default: "test"
+        description: "cases = replay my known setups, debug = explain one time, history = list recent setups, test = test message, run = normal check"
+        default: "cases"
         type: choice
         options:
-          - test
+          - cases
+          - debug
           - history
+          - test
           - run
+      symbol:
+        description: "debug only: XAUUSD or GBPUSD"
+        default: "XAUUSD"
+        type: string
+      tf:
+        description: "debug only: timeframe in minutes (5, 15 or 30)"
+        default: "5"
+        type: string
+      time:
+        description: "debug only: time to look at, UTC+3:30, format YYYY-MM-DD HH:MM"
+        default: "2026-09-15 17:00"
+        type: string
+      hours:
+        description: "debug only: hours of context before that time"
+        default: "12"
+        type: string
 
 permissions:
   contents: write
@@ -41,7 +59,11 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           HISTORY_DAYS: "5"
-        run: python mk_alert.py ${{ github.event.inputs.mode == 'test' && '--test' || '' }} ${{ github.event.inputs.mode == 'history' && '--history' || '' }} ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
+          DEBUG_SYMBOL: ${{ github.event.inputs.symbol }}
+          DEBUG_TF: ${{ github.event.inputs.tf }}
+          DEBUG_TIME: ${{ github.event.inputs.time }}
+          DEBUG_HOURS: ${{ github.event.inputs.hours }}
+        run: python mk_alert.py ${{ github.event.inputs.mode == 'test' && '--test' || '' }} ${{ github.event.inputs.mode == 'history' && '--history' || '' }} ${{ github.event.inputs.mode == 'cases' && '--cases' || '' }} ${{ github.event.inputs.mode == 'debug' && '--debug' || '' }} ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
 
       - name: Save state
         run: |
