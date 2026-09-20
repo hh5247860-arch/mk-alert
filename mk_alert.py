@@ -39,19 +39,20 @@ SYMBOLS = [
 TIMEFRAMES = [("5min", 5), ("15min", 15)]
 INTERVALS = {5: "5min", 15: "15min", 30: "30min"}
 
-# Same meaning as the inputs in the Pine / MQL5 versions
+# Detector settings
 PIV_LEN = 5          # swing pivot length
 ATR_LEN = 14         # ATR length
-LEG_MULT = 3.0       # prior leg min size (x ATR)
-BIG_MULT = 1.5       # exhaustion move in 1-2 candles (x ATR)
-USE_WEAK = False     # require weakening before the break
+TREND_HOURS = 10     # how far back to look for the strong trend (impulse) before the CHOCH
+LEG_MULT = 4.0       # the impulse before the CHOCH must be at least this many ATR
+BIG_MULT = 1.0       # exhaustion move in 1-2 candles (x ATR)
 BASE_N = 2           # origin candles used for the MK zone (1-4)
 MAX_ZONE = 3.0       # max MK zone height (x ATR)
-WEAK_MULT = 0.8      # weak candle max body (x ATR)
-MAX_WEAK = 2         # max weak candles inside MK
+WEAK_MULT = 0.8      # weak (hopeless) candle max body (x ATR)
+MAX_WEAK_BY_TF = {5: 6, 15: 3, 30: 3}   # max weak candles inside MK per timeframe
 STRICT_CLOSE = True  # reversal candle must close beyond the weak candles' extreme
 INV_TOL = 0.1        # invalidation tolerance beyond MK (x ATR)
-MAX_WAIT = 60        # max bars to wait after CHOCH
+EXPIRE_HOURS = 48    # an MK zone stays valid this long (unless price closes beyond it)
+MAX_ZONES = 8        # max simultaneous MK zones kept in memory
 
 HISTORY = 500        # candles downloaded per request (normal runs)
 HISTORY_BIG = 2000   # candles downloaded in --history mode
@@ -77,12 +78,24 @@ def _p(x):
     return f"{x:.6g}"
 
 
-def detect(candles, trace=None):
+def detect(candles, tf_min, trace=None):
     """candles: list of dicts (t, o, h, l, c), oldest -> newest, closed candles only.
     Returns a list of 'MK formed' events found in the whole window.
-    If trace is a list, human readable diagnostics are appended to it."""
+    If trace is a list, human readable diagnostics are appended to it.
+
+    Logic (same idea as the Pine / MQL5 versions, but MK zones now live on their own):
+      1. strong impulse in the last TREND_HOURS (leg >= LEG_MULT x ATR)
+      2. close breaks the pullback swing that formed after the impulse (CHOCH)
+         with 1-2 strong candles (>= BIG_MULT x ATR)
+      3. MK zone = origin candles before that move; it stays valid until price closes beyond it
+      4. price returns into MK, 1..N weak candles form inside it
+      5. first reversal candle closes -> alert
+    """
     n = len(candles)
     L = PIV_LEN
+    W = max(20, int(TREND_HOURS * 60 / tf_min))
+    expire = int(EXPIRE_HOURS * 60 / tf_min)
+    max_weak = MAX_WEAK_BY_TF.get(tf_min, 3)
     start = 2 * L + 25
     if n <= start + 2:
         return []
@@ -97,13 +110,11 @@ def detect(candles, trace=None):
             trace.append({"t": t, "kind": kind, "msg": msg})
 
     atr = None
-    sw_h = prev_sw_h = sw_l = prev_sw_l = None
-    state = 0
-    dirn = 0
-    z_hi = z_lo = leg_ref = ret_ext = w_ext = None
-    weak_cnt = 0
-    waited = 0
+    sw_h = sw_l = None
+    sw_h_i = sw_l_i = -1
+    zones = []
     out = []
+    used_l = used_h = -1   # swing pivots that already produced a CHOCH
 
     for i in range(1, n):
         # ATR (Wilder / RMA)
@@ -118,64 +129,129 @@ def detect(candles, trace=None):
             is_pl = all(lo[pi] < lo[pi - k] for k in range(1, L + 1)) and \
                     all(lo[pi] <= lo[pi + k] for k in range(1, L + 1))
             if is_ph:
-                prev_sw_h, sw_h = sw_h, h[pi]
+                sw_h, sw_h_i = h[pi], pi
                 note(candles[pi]["t"], "pivot", f"swing HIGH {_p(h[pi])}")
             if is_pl:
-                prev_sw_l, sw_l = sw_l, lo[pi]
+                sw_l, sw_l_i = lo[pi], pi
                 note(candles[pi]["t"], "pivot", f"swing LOW {_p(lo[pi])}")
 
         if i < start:
             continue
 
-        weak_ok = True
-        if USE_WEAK:
-            rec = sum(abs(cl[i - k] - o[i - k]) for k in range(2, 7)) / 5.0
-            old = sum(abs(cl[i - k] - o[i - k]) for k in range(7, 22)) / 15.0
-            weak_ok = rec < old
+        # ---- 1) update the MK zones that already exist ----
+        alive = []
+        for z in zones:
+            z["waited"] += 1
+            d = z["dir"]
+            if d == 1:
+                touch = h[i] >= z["lo"]
+                inv = cl[i] > z["hi"] + INV_TOL * atr
+            else:
+                touch = lo[i] <= z["hi"]
+                inv = cl[i] < z["lo"] - INV_TOL * atr
+            body = abs(cl[i] - o[i])
+            is_weak = touch and not inv and body <= WEAK_MULT * atr
 
-        # CHOCH + exhaustion move
-        bear = bull = False
-        if None not in (sw_h, prev_sw_h, sw_l, prev_sw_l):
-            up = sw_h > prev_sw_h and sw_l > prev_sw_l
-            leg_up = (sw_h - prev_sw_l) >= LEG_MULT * atr
-            disp_bear = (max(o[i], o[i - 1]) - cl[i]) >= BIG_MULT * atr
-            cross_dn = cl[i] < sw_l and cl[i - 1] >= sw_l
-            bear = up and leg_up and weak_ok and disp_bear and cross_dn
+            trig = False
+            if z["weak"] >= 1 and not inv and z["wext"] is not None:
+                if d == 1:
+                    trig = cl[i] < o[i] and (not STRICT_CLOSE or cl[i] < z["wext"])
+                else:
+                    trig = cl[i] > o[i] and (not STRICT_CLOSE or cl[i] > z["wext"])
 
-            dn = sw_h < prev_sw_h and sw_l < prev_sw_l
-            leg_dn = (prev_sw_h - sw_l) >= LEG_MULT * atr
-            disp_bull = (cl[i] - min(o[i], o[i - 1])) >= BIG_MULT * atr
-            cross_up = cl[i] > sw_h and cl[i - 1] <= sw_h
-            bull = dn and leg_dn and weak_ok and disp_bull and cross_up
+            tag = f"[{'SELL' if d == 1 else 'BUY'} MK {_p(z['lo'])}-{_p(z['hi'])}]"
+            keep = True
+            if touch:
+                note(candles[i]["t"], "touch",
+                     f"{tag} price in MK: close {_p(cl[i])}, body {body / atr:.2f} ATR "
+                     f"({'weak' if is_weak else 'not weak, limit ' + str(WEAK_MULT)})")
+            if inv:
+                keep = False
+                note(candles[i]["t"], "cancel", f"{tag} CANCELLED: closed beyond MK ({_p(cl[i])})")
+            elif trig:
+                sweep = False
+                if z["ret"] is not None:
+                    sweep = z["ret"] > z["ref"] if d == 1 else z["ret"] < z["ref"]
+                out.append({"i": i, "t": candles[i]["t"], "dir": d,
+                            "zlo": z["lo"], "zhi": z["hi"], "sweep": sweep})
+                keep = False
+                note(candles[i]["t"], "trigger", f"{tag} MK FORMED -> alert")
+            elif is_weak:
+                z["weak"] += 1
+                if d == 1:
+                    z["wext"] = lo[i] if z["wext"] is None else min(z["wext"], lo[i])
+                else:
+                    z["wext"] = h[i] if z["wext"] is None else max(z["wext"], h[i])
+                if z["weak"] > max_weak:
+                    keep = False
+                    note(candles[i]["t"], "cancel", f"{tag} CANCELLED: more than {max_weak} weak candles inside MK")
+            else:
+                z["weak"] = 0
+                z["wext"] = None
+            if keep and z["waited"] > expire:
+                keep = False
+                note(candles[i]["t"], "cancel", f"{tag} expired after {EXPIRE_HOURS}h")
+            if keep:
+                if d == 1:
+                    z["ret"] = h[i] if z["ret"] is None else max(z["ret"], h[i])
+                else:
+                    z["ret"] = lo[i] if z["ret"] is None else min(z["ret"], lo[i])
+                alive.append(z)
+        zones = alive
 
-            if trace is not None:
-                if cross_dn and not bear:
-                    why = []
-                    if not up:
-                        why.append("structure is not HH+HL before the break")
-                    if not leg_up:
-                        why.append(f"prior leg {(sw_h - prev_sw_l) / atr:.1f} ATR < {LEG_MULT}")
-                    if not disp_bear:
-                        why.append(f"break move {(max(o[i], o[i - 1]) - cl[i]) / atr:.1f} ATR < {BIG_MULT}")
-                    if not weak_ok:
-                        why.append("no weakening")
-                    note(candles[i]["t"], "cross",
-                         f"close broke below swing low {_p(sw_l)} but NOT a CHOCH: " + "; ".join(why))
-                if cross_up and not bull:
-                    why = []
-                    if not dn:
-                        why.append("structure is not LH+LL before the break")
-                    if not leg_dn:
-                        why.append(f"prior leg {(prev_sw_h - sw_l) / atr:.1f} ATR < {LEG_MULT}")
-                    if not disp_bull:
-                        why.append(f"break move {(cl[i] - min(o[i], o[i - 1])) / atr:.1f} ATR < {BIG_MULT}")
-                    if not weak_ok:
-                        why.append("no weakening")
-                    note(candles[i]["t"], "cross",
-                         f"close broke above swing high {_p(sw_h)} but NOT a CHOCH: " + "; ".join(why))
+        # ---- 2) look for a new CHOCH ----
+        s0 = max(0, i - W)
+        new = None  # (dir, ref level, leg size)
 
-        if bear or bull:
-            if bear:
+        if sw_l is not None and sw_l_i != used_l and cl[i] < sw_l and \
+                max(o[i], o[i - 1]) >= sw_l - 0.5 * atr:
+            pk = max(range(s0, i), key=lambda j: (h[j], j))
+            tro = min(lo[s0:pk + 1])
+            leg = h[pk] - tro
+            leg_ok = leg >= LEG_MULT * atr
+            low_ok = sw_l > tro and sw_l_i > pk
+            disp = max(o[i], o[i - 1]) - cl[i]
+            disp_ok = disp >= BIG_MULT * atr
+            if leg_ok and low_ok and disp_ok:
+                new = (1, h[pk], leg)
+                used_l = sw_l_i
+            elif cl[i - 1] >= sw_l:
+                why = []
+                if not leg_ok:
+                    why.append(f"no strong up-trend before it (impulse {leg / atr:.1f} ATR < {LEG_MULT})")
+                if not low_ok:
+                    why.append("broken low is not the pullback low after the impulse top")
+                if not disp_ok:
+                    why.append(f"break move {disp / atr:.1f} ATR < {BIG_MULT}")
+                note(candles[i]["t"], "cross",
+                     f"close broke below swing low {_p(sw_l)} but NOT a CHOCH: " + "; ".join(why))
+
+        if new is None and sw_h is not None and sw_h_i != used_h and cl[i] > sw_h and \
+                min(o[i], o[i - 1]) <= sw_h + 0.5 * atr:
+            bt = min(range(s0, i), key=lambda j: (lo[j], -j))
+            top = max(h[s0:bt + 1])
+            leg = top - lo[bt]
+            leg_ok = leg >= LEG_MULT * atr
+            high_ok = sw_h < top and sw_h_i > bt
+            disp = cl[i] - min(o[i], o[i - 1])
+            disp_ok = disp >= BIG_MULT * atr
+            if leg_ok and high_ok and disp_ok:
+                new = (-1, lo[bt], leg)
+                used_h = sw_h_i
+            elif cl[i - 1] <= sw_h:
+                why = []
+                if not leg_ok:
+                    why.append(f"no strong down-trend before it (impulse {leg / atr:.1f} ATR < {LEG_MULT})")
+                if not high_ok:
+                    why.append("broken high is not the pullback high after the impulse bottom")
+                if not disp_ok:
+                    why.append(f"break move {disp / atr:.1f} ATR < {BIG_MULT}")
+                note(candles[i]["t"], "cross",
+                     f"close broke above swing high {_p(sw_h)} but NOT a CHOCH: " + "; ".join(why))
+
+        if new is not None:
+            dirn, ref, leg = new
+            if dirn == 1:
                 off = 2 if (cl[i - 1] < o[i - 1] and (o[i - 1] - cl[i - 1]) >= 0.5 * BIG_MULT * atr) else 1
             else:
                 off = 2 if (cl[i - 1] > o[i - 1] and (cl[i - 1] - o[i - 1]) >= 0.5 * BIG_MULT * atr) else 1
@@ -184,102 +260,28 @@ def detect(candles, trace=None):
             lo_w = min(lo[j] for j in idx)
             b_hi = max(max(o[j], cl[j]) for j in idx)
             b_lo = min(min(o[j], cl[j]) for j in idx)
-
-            if bear:
-                dirn = 1
+            if dirn == 1:
                 z_hi, z_lo = hi_w, b_lo
                 if z_hi - z_lo > MAX_ZONE * atr:
                     z_lo = z_hi - MAX_ZONE * atr
-                leg_ref = sw_h
             else:
-                dirn = -1
                 z_lo, z_hi = lo_w, b_hi
                 if z_hi - z_lo > MAX_ZONE * atr:
                     z_hi = z_lo + MAX_ZONE * atr
-                leg_ref = sw_l
-            ret_ext = None
-            w_ext = None
-            weak_cnt = 0
-            waited = 0
-            state = 1
+            # a fresh CHOCH replaces an untouched zone of the same direction that overlaps it
+            zones = [e for e in zones
+                     if not (e["dir"] == dirn and e["lo"] <= z_hi and e["hi"] >= z_lo and e["weak"] == 0)]
+            zones.append({"dir": dirn, "lo": z_lo, "hi": z_hi, "ref": ref, "ret": None,
+                          "wext": None, "weak": 0, "waited": 0})
+            if len(zones) > MAX_ZONES:
+                zones = zones[-MAX_ZONES:]
             note(candles[i]["t"], "setup",
-                 f"CHOCH ok -> {'SELL' if dirn == 1 else 'BUY'} setup started, MK zone {_p(z_lo)} - {_p(z_hi)} (ATR {_p(atr)})")
-            continue
+                 f"CHOCH ok -> {'SELL' if dirn == 1 else 'BUY'} MK zone {_p(z_lo)} - {_p(z_hi)} "
+                 f"(impulse {leg / atr:.1f} ATR, ATR {_p(atr)})")
 
-        if state == 0:
-            continue
-
-        # waiting for MK to form
-        waited += 1
-        cancel = False
-        if dirn == 1:
-            touch = h[i] >= z_lo
-            inv = cl[i] > z_hi + INV_TOL * atr
-        else:
-            touch = lo[i] <= z_hi
-            inv = cl[i] < z_lo - INV_TOL * atr
-        body = abs(cl[i] - o[i])
-        is_weak = touch and not inv and body <= WEAK_MULT * atr
-
-        trig = False
-        if weak_cnt >= 1 and not inv and w_ext is not None:
-            if dirn == 1:
-                trig = cl[i] < o[i] and (not STRICT_CLOSE or cl[i] < w_ext)
-            else:
-                trig = cl[i] > o[i] and (not STRICT_CLOSE or cl[i] > w_ext)
-
-        if touch:
-            note(candles[i]["t"], "touch",
-                 f"price in MK: close {_p(cl[i])}, body {body / atr:.2f} ATR "
-                 f"({'weak' if is_weak else 'not weak (limit ' + str(WEAK_MULT) + ')'})")
-
-        if inv:
-            cancel = True
-            note(candles[i]["t"], "cancel", f"CANCELLED: closed beyond MK ({_p(cl[i])})")
-        elif trig:
-            sweep = False
-            if ret_ext is not None:
-                sweep = ret_ext > leg_ref if dirn == 1 else ret_ext < leg_ref
-            out.append({
-                "i": i,
-                "t": candles[i]["t"],
-                "dir": dirn,
-                "zlo": z_lo,
-                "zhi": z_hi,
-                "sweep": sweep,
-            })
-            note(candles[i]["t"], "trigger", f"MK FORMED {'SELL' if dirn == 1 else 'BUY'} -> alert")
-            state = 0
-        elif is_weak:
-            weak_cnt += 1
-            if dirn == 1:
-                w_ext = lo[i] if w_ext is None else min(w_ext, lo[i])
-            else:
-                w_ext = h[i] if w_ext is None else max(w_ext, h[i])
-            if weak_cnt > MAX_WEAK:
-                cancel = True
-                note(candles[i]["t"], "cancel", f"CANCELLED: more than {MAX_WEAK} weak candles inside MK")
-        else:
-            if weak_cnt > 0 and touch is False:
-                note(candles[i]["t"], "info", "left MK without a reversal candle, weak count reset")
-            weak_cnt = 0
-            w_ext = None
-
-        if state != 0 and not cancel and waited > MAX_WAIT:
-            cancel = True
-            note(candles[i]["t"], "cancel", f"CANCELLED: waited more than {MAX_WAIT} candles")
-
-        if state != 0:
-            if dirn == 1:
-                ret_ext = h[i] if ret_ext is None else max(ret_ext, h[i])
-            else:
-                ret_ext = lo[i] if ret_ext is None else min(ret_ext, lo[i])
-
-        if cancel:
-            state = 0
-
-    if state != 0:
-        note(candles[-1]["t"], "info", "setup is still open (waiting for MK to form)")
+    for z in zones:
+        note(candles[-1]["t"], "info",
+             f"[{'SELL' if z['dir'] == 1 else 'BUY'} MK {_p(z['lo'])}-{_p(z['hi'])}] still open, waiting")
     return out
 
 
@@ -393,7 +395,7 @@ def run_history(api_key, token, chat_id, now):
             time.sleep(1)
             if not candles:
                 continue
-            events = [ev for ev in detect(candles) if ev["t"] >= cutoff]
+            events = [ev for ev in detect(candles, tf_min) if ev["t"] >= cutoff]
             first = fmt_local(candles[0]["t"])
             lines = [f"MK history | {name} {tf_min}m | last {days} days | {len(events)} setups | data from {first} (UTC+3:30)"]
             for k, ev in enumerate(events, 1):
@@ -428,7 +430,7 @@ def explain_case(candles, label, name, tf_min, when, hours, exp_dir, exp_lo, exp
         return lines
 
     trace = []
-    events = detect(candles, trace)
+    events = detect(candles, tf_min, trace)
 
     # pass / fail
     found = [ev for ev in events
@@ -554,7 +556,7 @@ def main():
                 test_lines.append(f"{name} {tf_min}m: OK, {n} candles, last open {last}")
             key = f"{name}|{tf_min}"
             last_sent = state.get(key)
-            for ev in detect(candles):
+            for ev in detect(candles, tf_min):
                 if ev["i"] < n - LOOKBACK_BARS:
                     continue
                 ts = ev["t"].isoformat()
