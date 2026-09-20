@@ -48,9 +48,9 @@ BIG_MULT = 1.0       # exhaustion move in 1-2 candles (x ATR)
 BASE_N = 2           # origin candles used for the MK zone (1-4)
 MAX_ZONE = 3.0       # max MK zone height (x ATR)
 WEAK_MULT = 0.8      # weak (hopeless) candle max body (x ATR)
-MAX_WEAK_BY_TF = {5: 6, 15: 3, 30: 3}   # max weak candles inside MK per timeframe
+MAX_WEAK_BY_TF = {5: 6, 15: 4, 30: 4}   # max weak candles inside MK per timeframe
 STRICT_CLOSE = True  # reversal candle must close beyond the weak candles' extreme
-INV_TOL = 0.1        # invalidation tolerance beyond MK (x ATR)
+INV_TOL = 0.5        # invalidation tolerance beyond MK (x ATR)
 EXPIRE_HOURS = 48    # an MK zone stays valid this long (unless price closes beyond it)
 MAX_ZONES = 8        # max simultaneous MK zones kept in memory
 
@@ -68,7 +68,7 @@ CASES = [
     ("A", "XAUUSD", 5,  "2026-09-15 17:00", 12,  1, 4287.5, 4292.7),
     ("B", "XAUUSD", 15, "2026-09-15 18:00", 14,  1, 4287.5, 4292.7),
     ("C", "XAUUSD", 5,  "2026-09-17 23:30", 8,   1, 4349.2, 4352.3),
-    ("D", "XAUUSD", 15, "2026-09-09 18:30", 30,  1, 4418.0, 4428.0),
+    ("D", "XAUUSD", 15, "2026-09-09 18:30", 42,  1, 4418.0, 4428.0),
     ("E", "XAUUSD", 5,  "2026-09-07 15:30", 8,  -1, 4384.0, 4390.0),
 ]
 
@@ -185,8 +185,8 @@ def detect(candles, tf_min, trace=None):
                 if z["weak"] > max_weak:
                     keep = False
                     note(candles[i]["t"], "cancel", f"{tag} CANCELLED: more than {max_weak} weak candles inside MK")
-            else:
-                z["weak"] = 0
+            elif not touch:
+                z["weak"] = 0          # price left the zone: start counting again
                 z["wext"] = None
             if keep and z["waited"] > expire:
                 keep = False
@@ -213,7 +213,7 @@ def detect(candles, tf_min, trace=None):
             disp = max(o[i], o[i - 1]) - cl[i]
             disp_ok = disp >= BIG_MULT * atr
             if leg_ok and low_ok and disp_ok:
-                new = (1, h[pk], leg)
+                new = (1, h[pk], leg, sw_l)
                 used_l = sw_l_i
             elif cl[i - 1] >= sw_l:
                 why = []
@@ -236,7 +236,7 @@ def detect(candles, tf_min, trace=None):
             disp = cl[i] - min(o[i], o[i - 1])
             disp_ok = disp >= BIG_MULT * atr
             if leg_ok and high_ok and disp_ok:
-                new = (-1, lo[bt], leg)
+                new = (-1, lo[bt], leg, sw_h)
                 used_h = sw_h_i
             elif cl[i - 1] <= sw_h:
                 why = []
@@ -250,7 +250,7 @@ def detect(candles, tf_min, trace=None):
                      f"close broke above swing high {_p(sw_h)} but NOT a CHOCH: " + "; ".join(why))
 
         if new is not None:
-            dirn, ref, leg = new
+            dirn, ref, leg, level = new
             if dirn == 1:
                 off = 2 if (cl[i - 1] < o[i - 1] and (o[i - 1] - cl[i - 1]) >= 0.5 * BIG_MULT * atr) else 1
             else:
@@ -261,11 +261,11 @@ def detect(candles, tf_min, trace=None):
             b_hi = max(max(o[j], cl[j]) for j in idx)
             b_lo = min(min(o[j], cl[j]) for j in idx)
             if dirn == 1:
-                z_hi, z_lo = hi_w, b_lo
+                z_hi, z_lo = hi_w, min(b_lo, level)   # zone reaches down to the broken low
                 if z_hi - z_lo > MAX_ZONE * atr:
                     z_lo = z_hi - MAX_ZONE * atr
             else:
-                z_lo, z_hi = lo_w, b_hi
+                z_lo, z_hi = lo_w, max(b_hi, level)   # zone reaches up to the broken high
                 if z_hi - z_lo > MAX_ZONE * atr:
                     z_hi = z_lo + MAX_ZONE * atr
             # a fresh CHOCH replaces an untouched zone of the same direction that overlaps it
