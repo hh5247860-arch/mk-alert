@@ -44,20 +44,22 @@ PIV_LEN = 5          # swing pivot length
 ATR_LEN = 14         # ATR length
 TREND_HOURS = 10     # how far back to look for the strong trend (impulse) before the CHOCH
 LEG_MULT = 4.0       # the impulse before the CHOCH must be at least this many ATR
-BIG_MULT = 1.0       # exhaustion move in 1-2 candles (x ATR)
+BIG_MULT = 0.75      # exhaustion move in 1-2 candles (x ATR)
 BASE_N = 2           # origin candles used for the MK zone (1-4)
 MAX_ZONE = 3.0       # max MK zone height (x ATR)
 WEAK_MULT = 0.8      # weak (hopeless) candle max body (x ATR)
-MAX_WEAK_BY_TF = {5: 6, 15: 4, 30: 4}   # max weak candles inside MK per timeframe
+MAX_WEAK_BY_TF = {5: 12, 15: 6, 30: 6}  # max weak candles inside MK per timeframe
 STRICT_CLOSE = True  # reversal candle must close beyond the weak candles' extreme
 INV_TOL = 0.5        # invalidation tolerance beyond MK (x ATR)
+AWAY_MULT = 1.0      # price must first move this far (x ATR) away from the MK before a return counts
+MAX_FIRES = 2        # an MK zone may alert this many times (after each alert price must leave and return)
 EXPIRE_HOURS = 48    # an MK zone stays valid this long (unless price closes beyond it)
 MAX_ZONES = 8        # max simultaneous MK zones kept in memory
 
 HISTORY = 500        # candles downloaded per request (normal runs)
 HISTORY_BIG = 2000   # candles downloaded in --history mode
 HISTORY_DEBUG = 5000 # candles downloaded in --debug / --cases mode
-LOOKBACK_BARS = 3    # only alert for setups that completed in the last N closed candles
+LOOKBACK_MIN = 60     # only alert for setups that completed in the last N minutes (GitHub runs can be late)
 STATE_FILE = "state.json"
 LOCAL_TZ = timezone(timedelta(hours=3, minutes=30))  # shown in messages (UTC+3:30)
 
@@ -143,12 +145,21 @@ def detect(candles, tf_min, trace=None):
         for z in zones:
             z["waited"] += 1
             d = z["dir"]
+            armed = z["armed"]          # armed = price already left the zone on an earlier candle
             if d == 1:
-                touch = h[i] >= z["lo"]
+                touch = armed and h[i] >= z["lo"]
                 inv = cl[i] > z["hi"] + INV_TOL * atr
+                if not armed and lo[i] <= z["lo"] - AWAY_MULT * atr:
+                    z["armed"] = True
+                    note(candles[i]["t"], "info",
+                         f"[SELL MK {_p(z['lo'])}-{_p(z['hi'])}] price moved away, waiting for the return")
             else:
-                touch = lo[i] <= z["hi"]
+                touch = armed and lo[i] <= z["hi"]
                 inv = cl[i] < z["lo"] - INV_TOL * atr
+                if not armed and h[i] >= z["hi"] + AWAY_MULT * atr:
+                    z["armed"] = True
+                    note(candles[i]["t"], "info",
+                         f"[BUY MK {_p(z['lo'])}-{_p(z['hi'])}] price moved away, waiting for the return")
             body = abs(cl[i] - o[i])
             is_weak = touch and not inv and body <= WEAK_MULT * atr
 
@@ -174,8 +185,15 @@ def detect(candles, tf_min, trace=None):
                     sweep = z["ret"] > z["ref"] if d == 1 else z["ret"] < z["ref"]
                 out.append({"i": i, "t": candles[i]["t"], "dir": d,
                             "zlo": z["lo"], "zhi": z["hi"], "sweep": sweep})
-                keep = False
-                note(candles[i]["t"], "trigger", f"{tag} MK FORMED -> alert")
+                z["fired"] += 1
+                note(candles[i]["t"], "trigger", f"{tag} MK FORMED -> alert (#{z['fired']})")
+                if z["fired"] >= MAX_FIRES:
+                    keep = False
+                else:
+                    z["armed"] = False      # price has to leave the zone and come back again
+                    z["weak"] = 0
+                    z["wext"] = None
+                    z["ret"] = None
             elif is_weak:
                 z["weak"] += 1
                 if d == 1:
@@ -209,7 +227,7 @@ def detect(candles, tf_min, trace=None):
             tro = min(lo[s0:pk + 1])
             leg = h[pk] - tro
             leg_ok = leg >= LEG_MULT * atr
-            low_ok = sw_l > tro and sw_l_i > pk
+            low_ok = sw_l > tro
             disp = max(o[i], o[i - 1]) - cl[i]
             disp_ok = disp >= BIG_MULT * atr
             if leg_ok and low_ok and disp_ok:
@@ -220,7 +238,7 @@ def detect(candles, tf_min, trace=None):
                 if not leg_ok:
                     why.append(f"no strong up-trend before it (impulse {leg / atr:.1f} ATR < {LEG_MULT})")
                 if not low_ok:
-                    why.append("broken low is not the pullback low after the impulse top")
+                    why.append("broken low is not above the start of the up-trend (already a lower-low break)")
                 if not disp_ok:
                     why.append(f"break move {disp / atr:.1f} ATR < {BIG_MULT}")
                 note(candles[i]["t"], "cross",
@@ -232,7 +250,7 @@ def detect(candles, tf_min, trace=None):
             top = max(h[s0:bt + 1])
             leg = top - lo[bt]
             leg_ok = leg >= LEG_MULT * atr
-            high_ok = sw_h < top and sw_h_i > bt
+            high_ok = sw_h < top
             disp = cl[i] - min(o[i], o[i - 1])
             disp_ok = disp >= BIG_MULT * atr
             if leg_ok and high_ok and disp_ok:
@@ -243,7 +261,7 @@ def detect(candles, tf_min, trace=None):
                 if not leg_ok:
                     why.append(f"no strong down-trend before it (impulse {leg / atr:.1f} ATR < {LEG_MULT})")
                 if not high_ok:
-                    why.append("broken high is not the pullback high after the impulse bottom")
+                    why.append("broken high is not below the start of the down-trend (already a higher-high break)")
                 if not disp_ok:
                     why.append(f"break move {disp / atr:.1f} ATR < {BIG_MULT}")
                 note(candles[i]["t"], "cross",
@@ -272,7 +290,7 @@ def detect(candles, tf_min, trace=None):
             zones = [e for e in zones
                      if not (e["dir"] == dirn and e["lo"] <= z_hi and e["hi"] >= z_lo and e["weak"] == 0)]
             zones.append({"dir": dirn, "lo": z_lo, "hi": z_hi, "ref": ref, "ret": None,
-                          "wext": None, "weak": 0, "waited": 0})
+                          "wext": None, "weak": 0, "waited": 0, "armed": False, "fired": 0})
             if len(zones) > MAX_ZONES:
                 zones = zones[-MAX_ZONES:]
             note(candles[i]["t"], "setup",
@@ -433,16 +451,20 @@ def explain_case(candles, label, name, tf_min, when, hours, exp_dir, exp_lo, exp
     events = detect(candles, tf_min, trace)
 
     # pass / fail
-    found = [ev for ev in events
-             if when - timedelta(hours=4) <= ev["t"] <= when + timedelta(hours=1)
-             and (exp_dir is None or ev["dir"] == exp_dir)]
-    if found:
-        for ev in found:
-            side = "SELL" if ev["dir"] == 1 else "BUY"
-            lines.append(f"RESULT: FOUND {side} at {fmt_local(ev['t'] + timedelta(minutes=tf_min))} "
-                         f"zone {_p(ev['zlo'])} - {_p(ev['zhi'])}")
-    else:
+    near = [ev for ev in events
+            if when - timedelta(hours=4) <= ev["t"] <= when + timedelta(hours=1)
+            and (exp_dir is None or ev["dir"] == exp_dir)]
+    if not near:
         lines.append("RESULT: NOT FOUND")
+    for ev in near:
+        side = "SELL" if ev["dir"] == 1 else "BUY"
+        overlap = exp_lo is None or (ev["zlo"] <= exp_hi and ev["zhi"] >= exp_lo)
+        lines.append(f"RESULT: {'FOUND' if overlap else 'FOUND at the right time but the zone is different'} "
+                     f"{side} at {fmt_local(ev['t'] + timedelta(minutes=tf_min))} "
+                     f"zone {_p(ev['zlo'])} - {_p(ev['zhi'])}")
+    others = [ev for ev in events if ev not in near and w0 <= ev["t"] <= w1]
+    if others:
+        lines.append(f"other alerts inside this window: {len(others)}")
 
     # context: last swings before the window, then everything inside the window
     before = [e for e in trace if e["kind"] == "pivot" and e["t"] < w0][-4:]
@@ -452,12 +474,15 @@ def explain_case(candles, label, name, tf_min, when, hours, exp_dir, exp_lo, exp
         for e in before:
             lines.append(f"  {fmt_local(e['t'])} {e['msg']}")
     lines.append(f"what the detector saw ({fmt_local(w0)} -> {fmt_local(w1)}):")
-    shown = 0
+    touches = 0
     for e in inside:
-        if e["kind"] == "touch" and shown > 40:
-            continue
+        if e["kind"] == "touch":
+            touches += 1
+            if touches > 25:
+                continue
         lines.append(f"  {fmt_local(e['t'])} {e['msg']}")
-        shown += 1
+    if touches > 25:
+        lines.append(f"  ({touches - 25} more 'price in MK' lines hidden)")
     if not inside:
         lines.append("  nothing (no swing, no break, no setup)")
     return lines
@@ -557,7 +582,7 @@ def main():
             key = f"{name}|{tf_min}"
             last_sent = state.get(key)
             for ev in detect(candles, tf_min):
-                if ev["i"] < n - LOOKBACK_BARS:
+                if ev["i"] < n - max(3, LOOKBACK_MIN // tf_min):
                     continue
                 ts = ev["t"].isoformat()
                 if last_sent is not None and ts <= last_sent:
