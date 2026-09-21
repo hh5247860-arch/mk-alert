@@ -56,7 +56,7 @@ MAX_FIRES = 2        # an MK zone may alert this many times (after each alert pr
 EXPIRE_HOURS = 48    # an MK zone stays valid this long (unless price closes beyond it)
 MAX_ZONES = 8        # max simultaneous MK zones kept in memory
 
-HISTORY = 500        # candles downloaded per request (normal runs)
+HISTORY = 1500       # candles downloaded per request (normal runs) - enough to rebuild the last 2 days of MK zones
 HISTORY_BIG = 2000   # candles downloaded in --history mode
 HISTORY_DEBUG = 5000 # candles downloaded in --debug / --cases mode
 LOOKBACK_MIN = 60     # only alert for setups that completed in the last N minutes (GitHub runs can be late)
@@ -304,7 +304,7 @@ def detect(candles, tf_min, trace=None):
 
 
 # ───────────────────────── Data / Telegram ─────────────────────────
-def fetch(td_symbol, interval, tf_min, api_key, now, size=HISTORY):
+def fetch(td_symbol, interval, tf_min, api_key, now, size=HISTORY, kind="forex"):
     r = requests.get(
         "https://api.twelvedata.com/time_series",
         params={
@@ -331,8 +331,9 @@ def fetch(td_symbol, interval, tf_min, api_key, now, size=HISTORY):
             "c": float(v["close"]),
         })
     rows.sort(key=lambda x: x["t"])
-    # drop the candle that is still forming
-    return [x for x in rows if x["t"] + timedelta(minutes=tf_min) <= now]
+    # drop the candle that is still forming and the flat candles sent while the market is closed
+    return [x for x in rows
+            if x["t"] + timedelta(minutes=tf_min) <= now and market_open(kind, x["t"])]
 
 
 def send_telegram(token, chat_id, text):
@@ -364,15 +365,17 @@ def send_long(token, chat_id, lines, limit=3500):
 
 
 def market_open(kind, now):
-    """Rough forex/gold opening hours in UTC (closed Fri 22:00 -> Sun 22:00)."""
+    """Rough forex/gold opening hours in UTC.
+    Week opens Sunday and closes Friday at 21:00 UTC in summer (US daylight time, Apr-Oct) or 22:00 UTC in winter."""
     if kind == "crypto":
         return True
+    edge = 21 if 4 <= now.month <= 10 else 22
     wd = now.weekday()  # Mon=0 ... Sun=6
     if wd == 5:
         return False
-    if wd == 4 and now.hour >= 22:
+    if wd == 4 and now.hour >= edge:
         return False
-    if wd == 6 and now.hour < 22:
+    if wd == 6 and now.hour < edge:
         return False
     return True
 
@@ -403,7 +406,7 @@ def run_history(api_key, token, chat_id, now):
     for name, td_symbol, kind, digits in SYMBOLS:
         for interval, tf_min in TIMEFRAMES:
             try:
-                candles = fetch(td_symbol, interval, tf_min, api_key, now, size=HISTORY_BIG)
+                candles = fetch(td_symbol, interval, tf_min, api_key, now, size=HISTORY_BIG, kind=kind)
             except Exception as e:
                 text = f"MK history {name} {tf_min}m: FAILED ({str(e)[:80]})"
                 print(text)
@@ -497,7 +500,7 @@ def run_cases(api_key, token, chat_id, now):
         key = (name, tf_min)
         if key not in cache:
             try:
-                cache[key] = fetch(sym[1], INTERVALS[tf_min], tf_min, api_key, now, size=HISTORY_DEBUG)
+                cache[key] = fetch(sym[1], INTERVALS[tf_min], tf_min, api_key, now, size=HISTORY_DEBUG, kind=sym[2])
             except Exception as e:
                 cache[key] = None
                 print(f"{name} {tf_min}m download failed: {e}")
@@ -522,7 +525,7 @@ def run_debug(api_key, token, chat_id, now):
         send_telegram(token, chat_id, "debug: set DEBUG_SYMBOL (XAUUSD/GBPUSD), DEBUG_TF (5/15/30) and DEBUG_TIME (YYYY-MM-DD HH:MM)")
         return
     when = datetime.strptime(when_s, "%Y-%m-%d %H:%M").replace(tzinfo=LOCAL_TZ)
-    candles = fetch(sym[1], INTERVALS[tf_min], tf_min, api_key, now, size=HISTORY_DEBUG)
+    candles = fetch(sym[1], INTERVALS[tf_min], tf_min, api_key, now, size=HISTORY_DEBUG, kind=sym[2])
     lines = explain_case(candles, "manual", name, tf_min, when, hours, None, None, None)
     print("\n".join(lines))
     send_long(token, chat_id, lines)
@@ -567,7 +570,7 @@ def main():
             if not (test or force or now.minute % tf_min < 5):
                 continue
             try:
-                candles = fetch(td_symbol, interval, tf_min, api_key, now)
+                candles = fetch(td_symbol, interval, tf_min, api_key, now, kind=kind)
             except Exception as e:
                 print(f"{name} {interval}: download failed: {e}")
                 test_lines.append(f"{name} {tf_min}m: FAILED ({str(e)[:80]})")
