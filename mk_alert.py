@@ -584,11 +584,15 @@ def main():
                 test_lines.append(f"{name} {tf_min}m: OK, {n} candles, last open {last}")
             key = f"{name}|{tf_min}"
             last_sent = state.get(key)
-            for ev in detect(candles, tf_min):
-                if ev["i"] < n - max(3, LOOKBACK_MIN // tf_min):
-                    continue
+            events = detect(candles, tf_min)
+            recent = [e for e in events if e["i"] >= n - max(3, LOOKBACK_MIN // tf_min)]
+            last_candle = fmt_local(candles[-1]["t"]) if n else "-"
+            print(f"{name} {tf_min}m: {n} candles, last candle opened {last_candle} (UTC+3:30), "
+                  f"setups in the last {LOOKBACK_MIN} min: {len(recent)}, last alert already sent for: {last_sent}")
+            for ev in recent:
                 ts = ev["t"].isoformat()
                 if last_sent is not None and ts <= last_sent:
+                    print(f"  skipped (already sent): {fmt_local(ev['t'])}")
                     continue
                 side = "SELL" if ev["dir"] == 1 else "BUY"
                 close_t = (ev["t"] + timedelta(minutes=tf_min)).astimezone(LOCAL_TZ).strftime("%H:%M")
